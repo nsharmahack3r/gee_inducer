@@ -1,0 +1,519 @@
+# Satellite-covariate source registry.
+#
+# This file is the single source of truth for the GEE export tool
+# (scripts/gee_export.py). Nothing about asset IDs, bands, scales, cadences,
+# grids or QA specs is hardcoded in Python: adding a source means editing this
+# file. The Python side only knows about the *mechanisms* declared here
+# (cadence class, QA kind, derived expressions, ops) via registries in
+# src/movement/covariates/sources.py.
+#
+# The inventory, priorities and extraction policy come from covariate_plan.md §3
+# and §5; the quota constraints driving `export:` come from prompts/gee_export.md
+# §"Hard constraints" (verified 2026-09-17).
+
+export:
+  # Where batch exports are delivered. Earth Engine is a remote compute service
+  # and cannot write to a local path, so the only choices are which Google
+  # destination receives them:
+  #   drive         - Export.table.toDrive, into GEE_DRIVE_FOLDER (no billing)
+  #   cloud_storage - Export.table.toCloudStorage, into GCS_BUCKET
+  # The destination is a config value, not a code path.
+  destination: "drive"
+  # Fewer, larger tasks beat many small ones (2 concurrent tasks is the binding
+  # quota). Aim for this many features per export task and tune from observed
+  # runtimes. A bucket smaller than this still becomes one task.
+  target_features_per_task: 100000
+  # Never hold more than this many unfinished tasks in the queue at once,
+  # regardless of how many chunks remain.
+  max_tasks_in_queue: 500
+  # Consecutive time-buckets are merged into one task until it reaches
+  # `target_features_per_task`, so daily/monthly sources do not degenerate into
+  # hundreds of tiny tasks. This caps how many distinct images (time groups) a
+  # single task may touch, which keeps the EE graph bounded.
+  max_time_groups_per_task: 60
+  # Earth Engine's own READY-state ceiling, recorded here so `plan` can warn.
+  max_ready_tasks: 3000
+  # Poll with exponential backoff; never busy-wait.
+  poll_initial_seconds: 30
+  poll_max_seconds: 600
+  poll_backoff: 1.5
+  # Service-account submissions are rate limited; jitter every request.
+  retry_max_attempts: 5
+  retry_backoff_seconds: 5
+  retry_jitter_seconds: 3
+  # Export output.
+  file_format: "CSV"
+  gcs_prefix: "covariates"
+  results_root: "results/covariates"
+  # Point sampling uses the source's native scale; buffer sampling is a
+  # radius in metres applied to every source at or below `buffer_max_scale_m`.
+  buffer_radius_m: 30
+  buffer_max_scale_m: 30
+  # Dedup safety. A coarse source must collapse *spatially*: if it does not, the
+  # pixel-grid snapping is wrong and the tool would export one feature per fix
+  # (covariate_plan.md §5.2 / §9). The check is on distinct pixels, not on total
+  # unique keys, because for a source whose cadence matches the fix cadence
+  # (ERA5-Land hourly against hourly fixes) the (pixel, hour) key cannot collapse
+  # much even when snapping is perfect — the pixel count is the honest diagnostic.
+  min_pixel_reduction_ratio: 0.5
+  reduction_required_above_scale_m: 30
+  # Soft warning: unique keys this close to the fix count for a coarse source is
+  # worth eyeballing (it means the time key is doing no work).
+  warn_unique_ratio_above: 0.9
+  # Hard ceiling on points inlined into one task's FeatureCollection. Earth
+  # Engine rejects a request body above 10 MiB (10485760 bytes).
+  #
+  # Measured with `ee.serializer.encode` on the installed client:
+  #   - zipping coordinate/key arrays (what point_collection builds) = 36 B/point
+  #   - one ee.Feature per point                                      = 291 B/point
+  # so this cap is 100,000 * 36 B = 3.4 MiB, ~34% of the limit, leaving the rest
+  # for the per-bucket image graph. The per-Feature form is why the first
+  # mule_deer submit failed: 94,100 points = 26 MiB.
+  # Re-measure with scripts/measure_payload.py if the construction changes.
+  max_points_per_task: 100000
+  # Padding (degrees) around each point group's bounding box. Collections are
+  # filterBounds()'d to that box so nothing touches off-site tiles; the pad only
+  # selects images, never clips them, so it can be generous.
+  footprint_pad_deg: 0.02
+
+# In-scope datasets (prompts/gee_export.md). `african_elephant` is deliberately
+# absent: the tool must fail loudly if asked for it rather than produce partial
+# coverage. `fixes` is used by `plan` to report reduction ratios and task counts.
+datasets:
+  mule_deer:
+    csv: "mule_deer_reshaped.csv"
+    fixes: 948632
+  white_tail_deer:
+    csv: "white_tail_deer_reshaped.csv"
+    fixes: 559830
+  black_bear:
+    csv: "black_bear_reshaped.csv"
+    fixes: 156366
+    # This CSV ships a duplicated `individual_id` column; the reader keeps the
+    # first and asserts the duplicate agrees (see covariates.sources.read_fixes).
+    duplicate_columns: ["individual_id"]
+  lynx:
+    csv: "lynx_reshaped.csv"
+    fixes: 131930
+  wild_pig:
+    csv: "wild_pig_reshaped.csv"
+    fixes: 79165
+  cougars:
+    csv: "cougars_reshaped.csv"
+    fixes: 47777
+  boar:
+    csv: "boar_reshaped.csv"
+    fixes: 45079
+  wolf:
+    csv: "wolf_reshaped.csv"
+    fixes: 23604
+
+# ---------------------------------------------------------------------------
+# Sources. Each entry declares:
+#   asset            Earth Engine asset ID
+#   kind             image | image_collection
+#   bands            native bands to sample
+#   scale_factors    multiplicative scaling applied before sampling (native units -> SI)
+#   derived          [{name, expr}] ee.Image.expression() bands
+#   focal            [{name, source_band, op, radius_m}] multi-window focal derivations
+#   post             named image ops (see ops registry) applied before sampling
+#   scale_m          native pixel size in metres (drives buffer eligibility)
+#   cadence          static | annual | monthly | daily | subdaily | composite
+#   composite_days   half-window for composite cadences (± days, centred on the fix date)
+#   last_year        last year the product covers (annual products clamp to it)
+#   grid             pixel lattice used for dedup snapping (mode fixed | utm)
+#   qa               {kind, params} — QA masking, always applied
+#   reducers         [first] = native-scale point value only.
+#                    [first, mean] additionally emits a <param>_buf30 column from a
+#                    30 m-radius neighbourhood reducer (mean for continuous bands,
+#                    mode for the bands listed under `categorical`). Only honoured
+#                    for sources at or below export.buffer_max_scale_m.
+#   categorical      bands whose buffer reducer must be mode, not mean
+#   chunk_bucket     time-bucket granularity for chunking (static|year|month|day|hour|composite)
+#   tier             1 | 2 | 3 (covariate_plan.md §3)
+# ---------------------------------------------------------------------------
+sources:
+
+  # --- Tier 1: 10 m, core set ---------------------------------------------
+
+  dynamic_world:
+    tier: 1
+    description: "Dynamic World near-real-time land cover class probabilities."
+    asset: "GOOGLE/DYNAMICWORLD/V1"
+    kind: image_collection
+    bands: [water, trees, grass, flooded_vegetation, crops,
+            shrub_and_scrub, built, bare, snow_and_ice, label]
+    scale_m: 10
+    cadence: composite
+    composite_days: 16
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0000898315, 0.0000898315],
+           origin: [-180.0, 90.0], verified: true}
+    # Dynamic World probabilities are the signal; `label` is argmax and is kept
+    # only as a categorical companion. No cloud mask: the product is already
+    # cloud-screened and gap-free (covariate_plan.md §9).
+    qa: {kind: none}
+    reducers: [first, mean]
+    categorical: [label]
+    chunk_bucket: composite
+
+  sentinel2:
+    tier: 1
+    description: "Sentinel-2 SR Harmonized reflectance + derived vegetation indices."
+    asset: "COPERNICUS/S2_SR_HARMONIZED"
+    kind: image_collection
+    # QC bands (SCL, MSK_CLDPRB) are named in `qa` below, not sampled as columns.
+    bands: [B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12]
+    scale_factors:
+      B2: 0.0001
+      B3: 0.0001
+      B4: 0.0001
+      B5: 0.0001
+      B6: 0.0001
+      B7: 0.0001
+      B8: 0.0001
+      B8A: 0.0001
+      B11: 0.0001
+      B12: 0.0001
+    derived:
+      - {name: ndvi, expr: "(b('B8') - b('B4')) / (b('B8') + b('B4'))"}
+      - {name: evi, expr: "2.5 * (b('B8') - b('B4')) / (b('B8') + 6.0 * b('B4') - 7.5 * b('B2') + 1.0)"}
+      - {name: savi, expr: "1.5 * (b('B8') - b('B4')) / (b('B8') + b('B4') + 0.5)"}
+      - {name: ndwi, expr: "(b('B3') - b('B8')) / (b('B3') + b('B8'))"}
+      - {name: ndmi, expr: "(b('B8') - b('B11')) / (b('B8') + b('B11'))"}
+      - {name: nbr, expr: "(b('B8') - b('B12')) / (b('B8') + b('B12'))"}
+    # Green-up rate: NDVI change per day between this 16-day composite and the
+    # previous one. This is a finite-difference *proxy* for IRG (instantaneous
+    # rate of green-up); Bischof et al. 2012 / Ortega et al. derive IRG from the
+    # derivative of a double-logistic curve fitted to a whole season, which
+    # needs a per-pixel annual series and is not done here. (The former `irg`
+    # derived band was a copy of the NDVI formula and has been removed.)
+    temporal_rates:
+      - {name: ndvi_rate, band: ndvi, lag_windows: 1}
+    # Snow is *kept* in the composite (it is the surface the animal walks on,
+    # and masking it blanks every winter in WY/YNP). This band records the
+    # fraction of cloud-free observations in the window classified snow/ice
+    # (SCL 11), so the model can tell snowy low NDVI from bare ground.
+    class_fractions:
+      - {name: snow_fraction, band: SCL, classes: [11]}
+    scale_m: 10
+    cadence: composite
+    composite_days: 8
+    grid: {mode: utm, res: [10.0, 10.0], verified: true}
+    # SCL classes masked out: 0 no data, 1 saturated/defective, 3 cloud shadow,
+    # 8 cloud medium prob., 9 cloud high prob., 10 thin cirrus. Snow/ice (11) is
+    # deliberately kept — see class_fractions above. s2cloudless probability is
+    # joined from COPERNICUS/S2_CLOUD_PROBABILITY and pixels above 40 % dropped.
+    qa:
+      kind: s2_scl
+      params:
+        scl_classes: [0, 1, 3, 8, 9, 10]
+        cloud_probability:
+          asset: "COPERNICUS/S2_CLOUD_PROBABILITY"
+          band: "probability"
+          threshold: 40
+    reducers: [first, mean]
+    chunk_bucket: composite
+
+  sentinel1:
+    tier: 1
+    description: "Sentinel-1 GRD backscatter (VV/VH) + ratio."
+    asset: "COPERNICUS/S1_GRD"
+    kind: image_collection
+    bands: [VV, VH]
+    derived:
+      - {name: vv_vh_ratio, expr: "b('VV') - b('VH')"}
+    scale_m: 10
+    cadence: composite
+    composite_days: 12
+    grid: {mode: utm, res: [10.0, 10.0], verified: true}
+    qa:
+      kind: s1_orbit
+      params:
+        instrument_modes: ["IW"]
+        polarizations: ["VV", "VH"]
+    reducers: [first, mean]
+    chunk_bucket: composite
+
+  eth_canopy:
+    tier: 1
+    description: "ETH Global Canopy Height 2020 (10 m)."
+    asset: "users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1"
+    kind: image
+    # The product also publishes a canopy-height SD raster, but its exact asset ID
+    # is unconfirmed — it is deliberately not referenced here rather than guessed
+    # (a wrong asset ID would fail confusingly, or worse, point at another dataset).
+    bands: [canopy_height]
+    scale_m: 10
+    cadence: static
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0000898315, 0.0000898315],
+           origin: [-180.0, 90.0], verified: true}
+    qa: {kind: none}
+    reducers: [first, mean]
+    chunk_bucket: static
+
+  usgs_3dep:
+    tier: 1
+    description: "USGS 3DEP 10 m elevation + terrain derivatives at multiple focal windows."
+    asset: "USGS/3DEP/10m_collection"
+    # An ImageCollection of 1x1 degree tiles: composed with mosaic(), not first().
+    kind: image_collection
+    bands: [elevation]
+    # Slope/aspect/curvature/heat-load come from ee.Terrain helpers; TPI and TRI
+    # are focal statistics at the window sizes Engebretsen et al. (2025) used.
+    terrain: [slope, aspect, hillshade]
+    focal:
+      - {name: tpi_150, source_band: elevation, op: tpi, radius_m: 150}
+      - {name: tpi_210, source_band: elevation, op: tpi, radius_m: 210}
+      - {name: tpi_990, source_band: elevation, op: tpi, radius_m: 990}
+      - {name: tri_150, source_band: elevation, op: tri, radius_m: 150}
+      - {name: roughness_150, source_band: elevation, op: roughness, radius_m: 150}
+    scale_m: 10
+    cadence: static
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0000925926, 0.0000925926],
+           origin: [-180.0, 90.0], verified: false}
+    qa: {kind: none}
+    reducers: [first, mean]
+    chunk_bucket: static
+
+  # --- Tier 2: 30 m, US-specific ------------------------------------------
+
+  annual_nlcd:
+    tier: 2
+    description: "Annual NLCD land cover, fractional impervious surface, confidence."
+    asset: "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER"
+    kind: image_collection
+    # NOTE: the asset IDs below are from covariate_plan.md §3.2, but the *band
+    # names* for these sat-io sub-collections are unconfirmed and should be checked
+    # against `ee.ImageCollection(...).first().bandNames()` before the first submit.
+    bands: [landcover]
+    extra_collections:
+      fractional_impervious_surface:
+        asset: "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/FRACTIONAL_IMPERVIOUS_SURFACE"
+        bands: [impervious]
+      landcover_confidence:
+        asset: "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER_CONFIDENCE"
+        bands: [confidence]
+      impervious_descriptor:
+        asset: "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/IMPERVIOUS_DESCRIPTOR"
+        bands: [descriptor]
+      spectral_change_doy:
+        asset: "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/SPECTRAL_CHANGE_DOY"
+        bands: [doy]
+    scale_m: 30
+    cadence: annual
+    last_year: 2024
+    grid: {mode: fixed, crs: "EPSG:5070", res: [30.0, 30.0],
+           origin: [-2565585.0, 3312105.0], verified: false}
+    qa: {kind: none}
+    reducers: [first, mean]
+    categorical: [landcover, descriptor]
+    chunk_bucket: year
+
+  nass_cdl:
+    tier: 2
+    description: "USDA NASS Cropland Data Layer — crop identity, not generic cropland."
+    asset: "USDA/NASS/CDL"
+    kind: image_collection
+    bands: [cropland, cultivated, confidence]
+    scale_m: 30
+    cadence: annual
+    last_year: 2024
+    grid: {mode: fixed, crs: "EPSG:5070", res: [30.0, 30.0],
+           origin: [-2565585.0, 3312105.0], verified: false}
+    qa: {kind: none}
+    reducers: [first, mean]
+    categorical: [cropland, cultivated]
+    chunk_bucket: year
+
+  jrc_water:
+    tier: 2
+    description: "JRC Global Surface Water — occurrence/seasonality + derived distance to water."
+    asset: "JRC/GSW1_4/GlobalSurfaceWater"
+    kind: image
+    bands: [occurrence, seasonality, recurrence, transition, max_extent, change]
+    # distance_to_water needs a thresholded occurrence mask; declared as an op
+    # so the Python registry knows what to build without naming the source.
+    post:
+      - {op: distance_to_water, source_band: occurrence, threshold: 75.0, name: distance_to_water}
+    scale_m: 30
+    cadence: static
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0002694946, 0.0002694946],
+           origin: [-180.0, 90.0], verified: true}
+    qa: {kind: none}
+    reducers: [first, mean]
+    chunk_bucket: static
+
+  # --- Tier 3: coarse, temporally varying ---------------------------------
+
+  era5_land:
+    tier: 3
+    description: "ERA5-Land hourly reanalysis — the only covariate at the fixes' own cadence."
+    asset: "ECMWF/ERA5_LAND/HOURLY"
+    kind: image_collection
+    bands: [temperature_2m, dewpoint_temperature_2m, skin_temperature,
+            soil_temperature_level_1, soil_temperature_level_2,
+            soil_temperature_level_3, soil_temperature_level_4,
+            volumetric_soil_water_layer_1, volumetric_soil_water_layer_2,
+            volumetric_soil_water_layer_3, volumetric_soil_water_layer_4,
+            total_precipitation, snowfall_sum, snow_depth, snow_water_equivalent,
+            snow_cover, snow_density, snowmelt,
+            u_component_of_wind_10m, v_component_of_wind_10m,
+            surface_pressure, surface_solar_radiation_downwards,
+            surface_thermal_radiation_downwards, surface_net_solar_radiation,
+            surface_net_thermal_radiation, total_evaporation,
+            evaporation_from_bare_soil, transpiration,
+            sensible_heat_flux, latent_heat_flux, potential_evaporation,
+            leaf_area_index_high_vegetation, leaf_area_index_low_vegetation,
+            albedo, surface_runoff, sub_surface_runoff]
+    derived:
+      - {name: wind_speed_10m, expr: "sqrt(b('u_component_of_wind_10m')**2 + b('v_component_of_wind_10m')**2)"}
+      # Magnus formula (Alduchov & Eskridge 1996), percent. ERA5 temperatures are
+      # kelvin, hence the -273.15. (The previous expression was a fragment of a
+      # specific-humidity formula and did not yield relative humidity.)
+      - {name: relative_humidity_2m, expr: "100 * exp(17.625 * (b('dewpoint_temperature_2m') - 273.15) / (243.04 + b('dewpoint_temperature_2m') - 273.15)) / exp(17.625 * (b('temperature_2m') - 273.15) / (243.04 + b('temperature_2m') - 273.15))"}
+    scale_m: 11132
+    cadence: subdaily
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.1, 0.1],
+           origin: [-180.0, 90.0], verified: true}
+    qa: {kind: none}
+    reducers: [first]
+    chunk_bucket: month
+
+  modis_lst:
+    tier: 3
+    description: "MODIS Terra+Aqua land surface temperature, day/night."
+    asset: "MODIS/061/MOD11A1"
+    kind: image_collection
+    bands: [LST_Day_1km, LST_Night_1km, Emis_31, Emis_32, Day_view_time, Night_view_time]
+    extra_collections:
+      aqua:
+        asset: "MODIS/061/MYD11A1"
+        bands: [LST_Day_1km, LST_Night_1km]
+    scale_factors:
+      LST_Day_1km: 0.02
+      LST_Night_1km: 0.02
+      Emis_31: 0.002
+      Emis_32: 0.002
+    derived:
+      - {name: lst_day_night_diff, expr: "b('LST_Day_1km') - b('LST_Night_1km')"}
+    scale_m: 1000
+    cadence: daily
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0083333333, 0.0083333333],
+           origin: [-180.0, 90.0], verified: true}
+    qa:
+      kind: modis_lst_qc
+      params:
+        day_band: "QC_Day"
+        night_band: "QC_Night"
+        # Bit 0-1 mandatory QA: 0=good, 1=other quality, 2=cloud, 3=not set.
+        max_mandatory_qa: 0
+    reducers: [first]
+    chunk_bucket: day
+
+  modis_snow:
+    tier: 3
+    description: "MODIS NDSI snow cover."
+    asset: "MODIS/061/MOD10A1"
+    kind: image_collection
+    bands: [NDSI_Snow_Cover]
+    scale_m: 500
+    cadence: daily
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0041666667, 0.0041666667],
+           origin: [-180.0, 90.0], verified: true}
+    # Sentinel in the product: values > 100 are not valid snow retrievals.
+    qa: {kind: ndsi_max_valid, params: {band: "NDSI_Snow_Cover", max_valid: 100}}
+    reducers: [first]
+    chunk_bucket: day
+
+  modis_lai:
+    tier: 3
+    description: "MODIS combined LAI/FPAR (4-day composite), US-specific QC."
+    asset: "MODIS/061/MCD15A3H"
+    kind: image_collection
+    bands: [Lai, Fpar]
+    scale_factors: {Lai: 0.1, Fpar: 0.01}
+    scale_m: 500
+    cadence: composite
+    composite_days: 4
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0041666667, 0.0041666667],
+           origin: [-180.0, 90.0], verified: true}
+    qa:
+      kind: fpar_lai_qc
+      params:
+        band: "FparLai_QC"
+        # Bits 3-4 MODLAND_QC: 0=good, 1=other quality. Bits 5-7 SCF_QC.
+        modland_qa_start: 3
+        modland_qa_end: 4
+        max_modland_qa: 0
+    reducers: [first]
+    chunk_bucket: composite
+
+  modis_et:
+    tier: 3
+    description: "MODIS evapotranspiration / PET (8-day composite)."
+    asset: "MODIS/061/MOD16A2"
+    kind: image_collection
+    bands: [ET, PET, LE, PLE]
+    scale_factors: {ET: 0.1, PET: 0.1, LE: 0.0001, PLE: 0.0001}
+    scale_m: 500
+    cadence: composite
+    composite_days: 8
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0041666667, 0.0041666667],
+           origin: [-180.0, 90.0], verified: true}
+    qa:
+      kind: et_qc
+      params:
+        band: "ET_QC"
+        # Bits 0-1 MODLAND QC: 0=good, 1=other quality.
+        qa_start: 0
+        qa_end: 1
+        max_qa: 0
+    reducers: [first]
+    chunk_bucket: composite
+
+  modis_burn:
+    tier: 3
+    description: "MODIS burned area + derived days-since-burn."
+    asset: "MODIS/061/MCD64A1"
+    kind: image_collection
+    bands: [BurnDate, BurnUncertainty]
+    post:
+      - {op: days_since_burn, source_band: BurnDate, name: days_since_burn}
+    scale_m: 500
+    cadence: monthly
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0041666667, 0.0041666667],
+           origin: [-180.0, 90.0], verified: true}
+    qa: {kind: none}
+    reducers: [first]
+    chunk_bucket: month
+
+  viirs_nightlights:
+    tier: 3
+    description: "VIIRS monthly nighttime lights, cloud-free coverage filtered."
+    asset: "NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG"
+    kind: image_collection
+    bands: [avg_rad, cf_cvg]
+    scale_m: 464
+    cadence: monthly
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0041666667, 0.0041666667],
+           origin: [-180.0, 90.0], verified: true}
+    qa:
+      kind: viirs_cf_cvg
+      params: {band: "cf_cvg", max_observations: 0}
+    reducers: [first]
+    chunk_bucket: month
+
+  csp_ghm:
+    tier: 3
+    description: "CSP Global Human Modification index (2016, supersedes 2009 Human Footprint)."
+    asset: "CSP/HM/GlobalHumanModification"
+    # Published as an ImageCollection (one 2016 image), not a bare Image.
+    kind: image_collection
+    bands: [gHM]
+    scale_m: 1000
+    cadence: static
+    grid: {mode: fixed, crs: "EPSG:4326", res: [0.0083333333, 0.0083333333],
+           origin: [-180.0, 90.0], verified: true}
+    qa: {kind: none}
+    reducers: [first, mean]
+    chunk_bucket: static
